@@ -111,6 +111,27 @@ def default_negative_prompt(length, fps):
     return json.dumps(fill(DEFAULT_NEGATIVE_PROMPT), ensure_ascii=False, separators=(",", ":"))
 
 
+class TextEncodePAN2(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="TextEncodePAN2",
+            display_name="PAN 2 Text Encode",
+            category="model/conditioning/pan2",
+            description="Encodes a PAN 2 prompt exactly as written. PAN 2 prompts are structured JSON captions; the regular text encode box would read their braces and | characters as dynamic prompt syntax and change them.",
+            inputs=[
+                io.Clip.Input("clip"),
+                io.String.Input("prompt", multiline=True, dynamic_prompts=False, tooltip="The structured world-state caption (JSON), or plain text."),
+            ],
+            outputs=[io.Conditioning.Output()],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, clip, prompt) -> io.NodeOutput:
+        return io.NodeOutput(clip.encode_from_tokens_scheduled(clip.tokenize(prompt)))
+
+
 class PAN2NegativePrompt(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -118,7 +139,7 @@ class PAN2NegativePrompt(io.ComfyNode):
             node_id="PAN2NegativePrompt",
             display_name="PAN 2 Default Negative Prompt",
             category="model/conditioning/pan2",
-            description="The structured negative prompt PAN 2 was released with, its time ranges set to the length of the clip. Connect it to the text of a CLIP Text Encode node.",
+            description="The structured negative prompt PAN 2 was released with, its time ranges set to the length of the clip. Connect it to the prompt of a PAN 2 Text Encode node.",
             inputs=[
                 io.Int.Input("length", default=241, min=1, max=nodes.MAX_RESOLUTION, step=4, tooltip="Number of video frames."),
                 io.Float.Input("fps", default=24.0, min=1.0, max=120.0, step=0.01),
@@ -193,6 +214,7 @@ class PAN2Extension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [
+            TextEncodePAN2,
             PAN2NegativePrompt,
             PAN2ImageToVideo,
         ]
