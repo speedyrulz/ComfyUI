@@ -3,6 +3,7 @@ import json
 import torch
 from typing_extensions import override
 
+import comfy.ldm.pan2.forecast
 import comfy.model_management
 import comfy.utils
 import node_helpers
@@ -210,6 +211,39 @@ class PAN2ImageToVideo(io.ComfyNode):
         return io.NodeOutput(model, positive, negative, {"samples": latent})
 
 
+class PAN2Spectrum(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="PAN2Spectrum",
+            display_name="PAN 2 Spectrum (Step Forecast)",
+            category="model/conditioning/pan2",
+            description="Speeds up PAN 2 sampling with Spectrum: on some steps the transformer is skipped and its result is forecast from earlier steps. The video differs somewhat from a normal run. Made for samplers that call the model once per step (euler and similar).",
+            inputs=[
+                io.Model.Input("model"),
+                io.Int.Input("warmup_steps", default=5, min=2, max=1000, tooltip="Steps at the start that always run the model."),
+                io.Float.Input("window_size", default=2.0, min=1.0, max=64.0, step=0.05, tooltip="After the warm-up the model runs once every this many steps (rounded down). 1 with flex_window 0 turns forecasting off."),
+                io.Float.Input("flex_window", default=0.75, min=0.0, max=16.0, step=0.05, tooltip="The window grows by this much after every step that runs the model. 0 keeps a fixed spacing; higher is faster and less exact."),
+                io.Float.Input("blend", default=0.5, min=0.0, max=1.0, step=0.05, tooltip="Share of the Chebyshev forecast; the rest is a straight step from the last two results."),
+                io.Int.Input("degree", default=4, min=1, max=8, tooltip="Degree of the Chebyshev polynomials.", advanced=True),
+                io.Float.Input("ridge", default=0.1, min=0.0, max=100.0, step=0.01, tooltip="Regularization of the fit.", advanced=True),
+                io.Int.Input("final_steps", default=1, min=0, max=1000, tooltip="Steps at the end that always run the model.", advanced=True),
+                io.Combo.Input("history", options=["system RAM", "GPU"], tooltip="Where the results of earlier steps are kept (up to 10 per prompt). GPU avoids copies but needs the VRAM.", advanced=True),
+            ],
+            outputs=[io.Model.Output()],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, model, warmup_steps, window_size, flex_window, blend, degree=4, ridge=0.1, final_steps=1, history="system RAM") -> io.NodeOutput:
+        model = model.clone()
+        options = model.model_options["transformer_options"] = model.model_options.get("transformer_options", {}).copy()
+        options["pan2_step_forecaster"] = comfy.ldm.pan2.forecast.StepForecaster(
+            warmup_steps=warmup_steps, window_size=window_size, flex_window=flex_window, degree=degree, ridge=ridge, blend=blend,
+            final_steps=final_steps, history_on_gpu=history == "GPU")
+        return io.NodeOutput(model)
+
+
 class PAN2Extension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
@@ -217,6 +251,7 @@ class PAN2Extension(ComfyExtension):
             TextEncodePAN2,
             PAN2NegativePrompt,
             PAN2ImageToVideo,
+            PAN2Spectrum,
         ]
 
 

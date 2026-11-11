@@ -246,9 +246,18 @@ class PAN2Transformer3DModel(nn.Module):
         t_len, h_len, w_len = x.shape[2] // p_t, x.shape[3] // p_h, x.shape[4] // p_w
         device, dtype = x.device, x.dtype
 
+        temb = self.time_embedder(timestep_embedding(timestep.reshape(-1)).float())  # the modulation runs in float32
+
+        # Spectrum: on a forecast step the hidden state after the last block is predicted from earlier steps and
+        # only the output layer runs (comfy/ldm/pan2/forecast.py)
+        forecaster = None if comfy.model_management.in_training else transformer_options.get("pan2_step_forecaster", None)
+        if forecaster is not None:
+            hidden = forecaster.forecast(transformer_options, (batch, t_len * h_len * w_len, self.x_embedder.weight.shape[0]), device, dtype)
+            if hidden is not None:
+                return self.output(hidden, temb, batch, t_len, h_len, w_len)[:, :, :frames, :height, :width]
+
         pe = rope_freqs((t_len, h_len, w_len), self.rope_axes_dim, self.rope_theta, self.rope_temporal_scale, device)
         x = self.x_embedder(x).flatten(2).transpose(1, 2).contiguous()
-        temb = self.time_embedder(timestep_embedding(timestep.reshape(-1)).float())  # the modulation runs in float32
 
         context = self.context_embedder(context.to(dtype))
         for block in self.context_refiner:
@@ -273,8 +282,13 @@ class PAN2Transformer3DModel(nn.Module):
                 x, context = block(x, context, temb, pe, transformer_options=transformer_options)
         comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None)
 
+        if forecaster is not None:
+            forecaster.observe(transformer_options, x)
+        return self.output(x, temb, batch, t_len, h_len, w_len)[:, :, :frames, :height, :width]
+
+    def output(self, x, temb, batch, t_len, h_len, w_len):
+        p_t, p_h, p_w = self.patch_size
         scale, shift = self.norm_out(temb).float().unsqueeze(1).chunk(2, dim=-1)
         x = self.proj_out(modulated_norm(x, scale, shift))
         x = x.reshape(batch, t_len, h_len, w_len, self.out_channels, p_t, p_h, p_w)
-        x = x.permute(0, 4, 1, 5, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(2, 3)
-        return x[:, :, :frames, :height, :width]
+        return x.permute(0, 4, 1, 5, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(2, 3)
