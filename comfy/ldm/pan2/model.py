@@ -36,12 +36,32 @@ def rope_freqs(sizes, axes_dim, theta, temporal_scale, device):
     return torch.cat(cos, dim=1), torch.cat(sin, dim=1)
 
 
-def apply_rope(x, pe):
-    # x: [B, S, heads, head_dim]
-    cos, sin = pe[0][None, :, None, :], pe[1][None, :, None, :]
+# The reference runs the rotary embedding, the norms with their shift/scale and the gated residuals in float32 on the
+# whole sequence. Every one of them works on each token by itself, so here they run over slices of the token axis:
+# the same numbers, without several float32 copies of a long video sequence at the same time.
+TOKEN_CHUNK = 8192
+
+
+def sliced(fn, x, *seq):
+    # fn(x, *seq) -> a tensor of x's shape and dtype; x and seq share the token axis (dim 1)
+    if x.shape[1] <= TOKEN_CHUNK or comfy.model_management.in_training:
+        return fn(x, *seq)
+    out = torch.empty_like(x)
+    for a in range(0, x.shape[1], TOKEN_CHUNK):
+        b = a + TOKEN_CHUNK
+        out[:, a:b] = fn(x[:, a:b], *[t[:, a:b] for t in seq])
+    return out
+
+
+def _rope(x, cos, sin):
     x_real, x_imag = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)
     x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
     return (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
+
+
+def apply_rope(x, pe):
+    # x: [B, S, heads, head_dim]
+    return sliced(_rope, x, pe[0][None, :, None, :], pe[1][None, :, None, :])
 
 
 class FeedForward(nn.Module):
@@ -84,13 +104,17 @@ class Attention(nn.Module):
 
     def forward(self, x, context=None, pe=None, transformer_options={}):
         q = self.norm_q(self.to_q(x).unflatten(-1, (self.heads, -1)))
-        k = self.norm_k(self.to_k(x).unflatten(-1, (self.heads, -1)))
-        v = self.to_v(x).unflatten(-1, (self.heads, -1))
         if pe is not None:  # only the video stream is rotated
-            q, k = apply_rope(q, pe), apply_rope(k, pe)
+            q = apply_rope(q, pe)
         if context is not None:
             q = torch.cat([q, self.norm_added_q(self.add_q_proj(context).unflatten(-1, (self.heads, -1)))], dim=1)
+        k = self.norm_k(self.to_k(x).unflatten(-1, (self.heads, -1)))
+        if pe is not None:
+            k = apply_rope(k, pe)
+        if context is not None:
             k = torch.cat([k, self.norm_added_k(self.add_k_proj(context).unflatten(-1, (self.heads, -1)))], dim=1)
+        v = self.to_v(x).unflatten(-1, (self.heads, -1))
+        if context is not None:
             v = torch.cat([v, self.add_v_proj(context).unflatten(-1, (self.heads, -1))], dim=1)
         out = optimized_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), self.heads, skip_reshape=True, transformer_options=transformer_options)
         del q, k, v
@@ -128,6 +152,14 @@ def layer_norm(x, eps=1e-6):
     return torch.nn.functional.layer_norm(x, x.shape[-1:], None, None, eps)
 
 
+def modulated_norm(x, scale, shift, eps=1e-6):
+    return sliced(lambda t: (layer_norm(t.float(), eps) * (1 + scale) + shift).to(t.dtype), x)
+
+
+def gated_residual(x, y, gate):
+    return sliced(lambda t, u: (t.float() + u * gate).to(t.dtype), x, y)
+
+
 class TransformerBlock(nn.Module):
     # Joint attention over [video; text]; each stream has its own projections and feed-forward network. The video
     # stream is modulated by the timestep, the text stream by a learned table. As in the reference, the norms, their
@@ -147,18 +179,19 @@ class TransformerBlock(nn.Module):
         table = comfy.model_management.cast_to(self.scale_shift_table_context, dtype=torch.float32, device=x.device)
         c_shift_msa, c_scale_msa, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = table.chunk(6, dim=-1)
 
-        norm_x = (layer_norm(x.float(), self.eps) * (1 + scale_msa) + shift_msa).type_as(x)
-        norm_c = (layer_norm(context.float(), self.eps) * (1 + c_scale_msa) + c_shift_msa).type_as(context)
+        norm_x = modulated_norm(x, scale_msa, shift_msa, self.eps)
+        norm_c = modulated_norm(context, c_scale_msa, c_shift_msa, self.eps)
         attn_x, attn_c = self.attn(norm_x, norm_c, pe, transformer_options=transformer_options)
         del norm_x, norm_c
-        x = (x.float() + attn_x * gate_msa).type_as(x)
-        context = (context.float() + attn_c * c_gate_msa).type_as(context)
+        x = gated_residual(x, attn_x, gate_msa)
+        context = gated_residual(context, attn_c, c_gate_msa)
         del attn_x, attn_c
 
-        norm_x = (layer_norm(x.float(), self.eps) * (1 + scale_mlp) + shift_mlp).type_as(x)
-        norm_c = (layer_norm(context.float(), self.eps) * (1 + c_scale_mlp) + c_shift_mlp).type_as(context)
-        x = (x.float() + self.ff(norm_x) * gate_mlp).type_as(x)
-        context = (context.float() + self.ff_context(norm_c) * c_gate_mlp).type_as(context)
+        norm_x = modulated_norm(x, scale_mlp, shift_mlp, self.eps)
+        x = gated_residual(x, self.ff(norm_x), gate_mlp)
+        del norm_x
+        norm_c = modulated_norm(context, c_scale_mlp, c_shift_mlp, self.eps)
+        context = gated_residual(context, self.ff_context(norm_c), c_gate_mlp)
         return x, context
 
 
@@ -241,7 +274,7 @@ class PAN2Transformer3DModel(nn.Module):
         comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None)
 
         scale, shift = self.norm_out(temb).float().unsqueeze(1).chunk(2, dim=-1)
-        x = self.proj_out((layer_norm(x.float()) * (1 + scale) + shift).to(dtype))
+        x = self.proj_out(modulated_norm(x, scale, shift))
         x = x.reshape(batch, t_len, h_len, w_len, self.out_channels, p_t, p_h, p_w)
         x = x.permute(0, 4, 1, 5, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(2, 3)
         return x[:, :, :frames, :height, :width]
