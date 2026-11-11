@@ -1,4 +1,6 @@
 import json
+import logging
+import sys
 
 import torch
 from typing_extensions import override
@@ -244,6 +246,79 @@ class PAN2Spectrum(io.ComfyNode):
         return io.NodeOutput(model)
 
 
+def _low_memory_sage():
+    """KJNodes' SageAttention routine that frees q, k and v as soon as they are quantized, when that pack is loaded and
+    every visible GPU is of the architecture it picked its kernels for."""
+    for module in list(sys.modules.values()):
+        fn = getattr(module, "_sageattn_int8_fp8_nhd", None)
+        archs = getattr(module, "_cuda_archs", None)
+        if callable(fn) and archs and len(set(archs)) == 1:
+            return fn
+    return None
+
+
+class SageJointAttention:
+    """SageAttention (int8 queries and keys, fp8 values) for PAN 2's joint attention, on [batch, tokens, heads, head_dim]."""
+
+    def __init__(self, head_chunks):
+        self.head_chunks = head_chunks
+        self.low_memory = _low_memory_sage()
+        logging.info("PAN 2 Sage attention: %s", "KJNodes low-memory routine" if self.low_memory is not None else "sageattention package")
+
+    def attend(self, qkv, dtype):
+        if self.low_memory is not None:
+            return self.low_memory(qkv, dtype)
+        import sageattention
+        q, k, v = qkv
+        qkv.clear()
+        return sageattention.sageattn(q.contiguous(), k.contiguous(), v.contiguous(), tensor_layout="NHD", is_causal=False).to(dtype)
+
+    def __call__(self, qkv, heads, transformer_options):
+        dtype, (batch, tokens) = qkv[0].dtype, qkv[0].shape[:2]
+        groups = min(self.head_chunks, heads)
+        if groups <= 1:
+            return self.attend(qkv, dtype).reshape(batch, tokens, -1)
+        # a group of heads at a time: the quantized working set shrinks by the number of groups
+        q, k, v = qkv
+        qkv.clear()
+        out = torch.empty((batch, tokens, heads, q.shape[-1]), dtype=dtype, device=q.device)
+        start = 0
+        for i in range(groups):
+            end = start + heads // groups + (1 if i < heads % groups else 0)
+            out[:, :, start:end] = self.attend([q[:, :, start:end].contiguous(), k[:, :, start:end].contiguous(), v[:, :, start:end].contiguous()], dtype)
+            start = end
+        del q, k, v
+        return out.flatten(2)
+
+
+class PAN2SageAttention(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="PAN2SageAttention",
+            display_name="PAN 2 Mem Eff Sage Attention",
+            category="model/conditioning/pan2",
+            description="Runs PAN 2's joint video and text attention with SageAttention (8-bit attention kernels) and frees the full-size queries, keys and values early. Faster on long videos and lower peak VRAM; the result differs slightly. Needs the sageattention package; with KJNodes installed its low-memory routine is used.",
+            inputs=[
+                io.Model.Input("model"),
+                io.Int.Input("head_chunks", default=1, min=1, max=32, tooltip="Attend this many groups of heads one after the other. More groups need less VRAM during attention and are a little slower."),
+            ],
+            outputs=[io.Model.Output()],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, model, head_chunks) -> io.NodeOutput:
+        try:
+            import sageattention  # noqa: F401
+        except ImportError as e:
+            raise RuntimeError("PAN 2 Mem Eff Sage Attention needs the sageattention package.") from e
+        model = model.clone()
+        options = model.model_options["transformer_options"] = model.model_options.get("transformer_options", {}).copy()
+        options["pan2_joint_attention"] = SageJointAttention(head_chunks)
+        return io.NodeOutput(model)
+
+
 class PAN2Extension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
@@ -252,6 +327,7 @@ class PAN2Extension(ComfyExtension):
             PAN2NegativePrompt,
             PAN2ImageToVideo,
             PAN2Spectrum,
+            PAN2SageAttention,
         ]
 
 

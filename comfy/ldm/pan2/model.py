@@ -74,6 +74,11 @@ class FeedForward(nn.Module):
         self.net = nn.ModuleList([proj, nn.Identity(), operations.Linear(inner_dim, dim, bias=bias, dtype=dtype, device=device)])
 
     def forward(self, x):
+        # every token goes through on its own, so the wide intermediate (8x the model width for video) is only ever
+        # held for one slice of the sequence
+        return sliced(self._forward, x)
+
+    def _forward(self, x):
         x = self.net[0].proj(x)
         if self.swiglu:
             x, gate = x.chunk(2, dim=-1)
@@ -116,8 +121,16 @@ class Attention(nn.Module):
         v = self.to_v(x).unflatten(-1, (self.heads, -1))
         if context is not None:
             v = torch.cat([v, self.add_v_proj(context).unflatten(-1, (self.heads, -1))], dim=1)
-        out = optimized_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), self.heads, skip_reshape=True, transformer_options=transformer_options)
-        del q, k, v
+        # a node can take over the joint attention (PAN 2 Mem Eff Sage Attention): it gets the only references to
+        # q, k and v as [batch, tokens, heads, head_dim] and returns [batch, tokens, dim]
+        joint_attention = None if context is None or comfy.model_management.in_training else transformer_options.get("pan2_joint_attention", None)
+        if joint_attention is not None:
+            qkv = [q, k, v]
+            del q, k, v
+            out = joint_attention(qkv, self.heads, transformer_options)
+        else:
+            out = optimized_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), self.heads, skip_reshape=True, transformer_options=transformer_options)
+            del q, k, v
         if context is None:
             return self.to_out[0](out)
         n = x.shape[1]
