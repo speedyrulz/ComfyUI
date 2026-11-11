@@ -96,6 +96,7 @@ import comfy.text_encoders.sa3
 import comfy.text_encoders.gpt_oss
 import comfy.text_encoders.joyimage
 import comfy.text_encoders.moss_image
+import comfy.text_encoders.pan2
 import comfy.text_encoders.fibo2
 
 import comfy.model_patcher
@@ -503,6 +504,8 @@ class VAE:
         is_seedvr2_vae = "decoder.up_blocks.2.upsamplers.0.upscale_conv.weight" in sd
         if not is_seedvr2_vae and 'decoder.up_blocks.0.resnets.0.norm1.weight' in sd.keys(): #diffusers format
             sd = diffusers_convert.convert_vae_state_dict(sd)
+        if 'decoder.mid_block.resnets.0.norm1.gamma' in sd.keys():  # diffusers AutoencoderKLWan
+            sd = comfy.ldm.wan.vae2_2.convert_wan_diffusers_vae(sd)
 
         if model_management.is_amd():
             VAE_KL_MEM_RATIO = 2.73
@@ -1707,6 +1710,7 @@ class CLIPType(Enum):
     FLUX3 = 37
     MOSS_IMAGE = 38
     FIBO2 = 39
+    PAN2 = 40
 
 
 
@@ -1823,6 +1827,8 @@ def detect_te_model(sd):
             return TEModel.QWEN25_3B
         if weight.shape[0] == 512:
             return TEModel.QWEN25_7B
+    if "layers.0.linear_attn.A_log" in sd and "layers.0.input_layernorm.weight" in sd and "embed_tokens.weight" in sd:  # transformers Qwen3_5TextModel layout
+        return {1024: TEModel.QWEN35_08B, 2048: TEModel.QWEN35_2B, 2560: TEModel.QWEN35_4B, 4096: TEModel.QWEN35_9B, 5120: TEModel.QWEN35_27B}.get(sd["layers.0.input_layernorm.weight"].shape[0], TEModel.QWEN35_2B)
     if "model.language_model.layers.0.linear_attn.A_log" in sd and "model.language_model.layers.0.input_layernorm.weight" in sd:
         weight = sd['model.language_model.layers.0.input_layernorm.weight']
         if weight.shape[0] == 1024:
@@ -2065,7 +2071,12 @@ def load_text_encoder_state_dicts(state_dicts=[], embedding_directory=None, clip
             clip_target.tokenizer = comfy.text_encoders.jina_clip_2.JinaClip2TokenizerWrapper
         elif te_model in (TEModel.QWEN35_08B, TEModel.QWEN35_2B, TEModel.QWEN35_4B, TEModel.QWEN35_9B, TEModel.QWEN35_27B):
             clip_data[0] = comfy.utils.state_dict_prefix_replace(clip_data[0], {"model.language_model.": "model.", "model.visual.": "visual.", "lm_head.": "model.lm_head."})
-            if clip_type == CLIPType.MOSS_IMAGE and te_model == TEModel.QWEN35_9B:  # MOSS-Image: stock Qwen3.5-9B, last hidden state, open think block.
+            if "layers.0.linear_attn.A_log" in clip_data[0]:  # bare text model (transformers Qwen3_5TextModel)
+                clip_data[0] = comfy.utils.state_dict_prefix_replace(clip_data[0], {"": "model."})
+            if clip_type == CLIPType.PAN2 and te_model == TEModel.QWEN35_9B:  # PAN 2: stock Qwen3.5-9B, hidden_states[-3], tokens after the user header.
+                clip_target.clip = comfy.text_encoders.pan2.te(**llama_detect(clip_data), mtp="mtp.fc.weight" in clip_data[0])
+                clip_target.tokenizer = comfy.text_encoders.pan2.PAN2Tokenizer
+            elif clip_type == CLIPType.MOSS_IMAGE and te_model == TEModel.QWEN35_9B:  # MOSS-Image: stock Qwen3.5-9B, last hidden state, open think block.
                 clip_target.clip = comfy.text_encoders.moss_image.te(**llama_detect(clip_data), mtp="mtp.fc.weight" in clip_data[0])
                 clip_target.tokenizer = comfy.text_encoders.moss_image.MOSSImageTokenizer
             else:

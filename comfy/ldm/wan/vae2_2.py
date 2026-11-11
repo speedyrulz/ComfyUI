@@ -776,3 +776,39 @@ class WanVAE(nn.Module):
             return mu
         std = torch.exp(0.5 * log_var.clamp(-30.0, 20.0))
         return mu + std * torch.randn_like(std)
+
+
+def convert_wan_diffusers_vae(sd):
+    """diffusers AutoencoderKLWan (Wan 2.2 residual layout) key names -> the original ones."""
+    resnet = {"norm1": "residual.0", "conv1": "residual.2", "norm2": "residual.3", "conv2": "residual.6", "conv_shortcut": "shortcut"}
+    counts = {}
+    for k in sd:
+        p = k.split(".")
+        if len(p) > 4 and p[1] in ("down_blocks", "up_blocks") and p[3] == "resnets":
+            counts[(p[0], p[2])] = max(counts.get((p[0], p[2]), 0), int(p[4]) + 1)
+    out = {}
+    for k, v in sd.items():
+        p = k.split(".")
+        if p[0] == "quant_conv":
+            n = ["conv1"] + p[1:]
+        elif p[0] == "post_quant_conv":
+            n = ["conv2"] + p[1:]
+        elif p[1] == "conv_in":
+            n = [p[0], "conv1"] + p[2:]
+        elif p[1] == "conv_out":
+            n = [p[0], "head", "2"] + p[2:]
+        elif p[1] == "norm_out":
+            n = [p[0], "head", "0"] + p[2:]
+        elif p[1] == "mid_block":
+            if p[2] == "resnets":
+                n = [p[0], "middle", str(int(p[3]) * 2), resnet[p[4]]] + p[5:]
+            else:
+                n = [p[0], "middle", "1"] + p[4:]
+        else:
+            group = "downsamples" if p[1] == "down_blocks" else "upsamples"
+            if p[3] == "resnets":
+                n = [p[0], group, p[2], group, p[4], resnet[p[5]]] + p[6:]
+            else:  # downsampler / upsampler: it follows the resnets of its block
+                n = [p[0], group, p[2], group, str(counts[(p[0], p[2])])] + p[4:]
+        out[".".join(n)] = v
+    return out
