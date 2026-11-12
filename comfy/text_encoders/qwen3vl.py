@@ -60,12 +60,24 @@ class Qwen3VL(BaseLlama, BaseQwen3, BaseGenerate, torch.nn.Module):
         self.visual = Qwen3VLVisionModel(vision_config, device=device, dtype=dtype, ops=operations)
         self.dtype = dtype
 
+    # optional {id(image): (image, merged, extra)} set by a caller that encodes the same images more than once
+    vision_cache = None
+
     def preprocess_embed(self, embed, device):
         if embed["type"] == "image":
+            data = embed["data"]
+            cache = self.vision_cache
+            if cache is not None:
+                hit = cache.get(id(data))
+                if hit is not None and hit[0] is data:
+                    return hit[1], hit[2]
             # Qwen3-VL normalizes to [-1, 1] (mean/std 0.5), unlike Qwen2.5-VL's CLIP normalization.
-            image, grid = comfy.text_encoders.qwen_vl.process_qwen2vl_images(embed["data"], patch_size=16, image_mean=[0.5, 0.5, 0.5], image_std=[0.5, 0.5, 0.5])
+            image, grid = comfy.text_encoders.qwen_vl.process_qwen2vl_images(data, patch_size=16, image_mean=[0.5, 0.5, 0.5], image_std=[0.5, 0.5, 0.5])
             merged, deepstack = self.visual(image.to(device, dtype=torch.float32), grid)
-            return merged, {"grid": grid, "deepstack": deepstack}
+            extra = {"grid": grid, "deepstack": deepstack}
+            if cache is not None:
+                cache[id(data)] = (data, merged, extra)
+            return merged, extra
         return None, None
 
     def build_image_inputs(self, embeds, embeds_info):

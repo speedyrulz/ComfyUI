@@ -173,8 +173,12 @@ class TextEncodeQwenImage21(io.ComfyNode):
                 ref_latents.append(vae.encode(s))
 
         keep_vision = len(ref_latents) == 0
-        positive = clip.encode_from_tokens_scheduled(clip.tokenize(prompt, images=images_vl, keep_vision=keep_vision, prevent_empty_text=True))
-        negative = clip.encode_from_tokens_scheduled(clip.tokenize(negative_prompt, images=images_vl, keep_vision=keep_vision, prevent_empty_text=True))
+        # both prompts see the same images, so the vision tower and the shared prefix run once
+        # (not with scheduled clip hooks, whose weights change between the encodes)
+        prefix_share = {} if len(images_vl) > 0 and (clip.patcher.forced_hooks is None or not clip.use_clip_schedule) else None
+        positive = clip.encode_from_tokens_scheduled(clip.tokenize(prompt, images=images_vl, keep_vision=keep_vision, prevent_empty_text=True, prefix_share=prefix_share))
+        negative = clip.encode_from_tokens_scheduled(clip.tokenize(negative_prompt, images=images_vl, keep_vision=keep_vision, prevent_empty_text=True, prefix_share=prefix_share))
+        prefix_share = None  # frees the cached prefix before sampling
         if len(ref_latents) > 0:
             positive = node_helpers.conditioning_set_values(positive, {"reference_latents": ref_latents}, append=True)
             negative = node_helpers.conditioning_set_values(negative, {"reference_latents": ref_latents}, append=True)
