@@ -41,7 +41,7 @@ class OFTDiff(WeightAdapterTrainBase):
             if q_norm > self.constraint:
                 normed_q = q * self.constraint / q_norm
         # use float() to prevent unsupported type
-        r = (I + normed_q) @ (I - normed_q).float().inverse()
+        r = (I + normed_q).float() @ (I - normed_q).float().inverse()
 
         ## Apply chunked matmul on weight
         _, *shape = w.shape
@@ -73,7 +73,7 @@ class OFTDiff(WeightAdapterTrainBase):
                 normed_q = q * self.constraint / q_norm
 
         # Cayley transform: R = (I + Q)(I - Q)^-1
-        r = (I + normed_q) @ (I - normed_q).float().inverse()
+        r = (I + normed_q).float() @ (I - normed_q).float().inverse()
         return r.to(dtype)
 
     def h(self, x: torch.Tensor, base_out: torch.Tensor) -> torch.Tensor:
@@ -225,7 +225,7 @@ class OFTAdapter(WeightAdapterBase):
                 if q_norm > alpha:
                     normed_q = q * alpha / q_norm
             # use float() to prevent unsupported type in .inverse()
-            r = (I + normed_q) @ (I - normed_q).float().inverse()
+            r = (I + normed_q).float() @ (I - normed_q).float().inverse()
             r = r.to(weight)
             # Create I in weight's dtype for the einsum
             I_w = torch.eye(block_size, device=weight.device, dtype=weight.dtype)
@@ -273,8 +273,8 @@ class OFTAdapter(WeightAdapterBase):
                 normed_q = q * alpha / q_norm
 
         # Cayley transform: R = (I + Q)(I - Q)^-1
-        r = (I + normed_q) @ (I - normed_q).float().inverse()
-        return r, block_num, block_size
+        r = (I + normed_q).float() @ (I - normed_q).float().inverse()
+        return r.to(dtype), block_num, block_size
 
     def g(self, y: torch.Tensor) -> torch.Tensor:
         """
