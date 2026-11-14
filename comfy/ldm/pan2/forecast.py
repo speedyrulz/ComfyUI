@@ -113,8 +113,6 @@ class StepForecaster:
         fresh = stream is None or index < stream.last_step or stream.total_steps != total_steps \
             or (len(stream.states) > 0 and tuple(stream.states[-1].shape) != tuple(shape))
         if fresh:
-            if index == 0:  # a new run: drop what earlier runs left behind
-                self.streams = {k: v for k, v in self.streams.items() if v.last_step == 0}
             stream = self.streams[key] = _Stream()
             stream.total_steps = total_steps
         return stream
@@ -168,4 +166,3 @@ class StepForecaster:
     def _report(stream, index, total_steps):
         if index == total_steps - 1:
             logging.info("PAN 2 Spectrum: %d steps, %d ran the model, %d forecast", total_steps, stream.actual, stream.forecast)
-            stream.steps, stream.states = [], []  # the run is over, free the kept states
