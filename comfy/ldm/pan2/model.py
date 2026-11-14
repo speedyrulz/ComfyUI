@@ -9,7 +9,10 @@ from torch import nn
 import comfy.ldm.common_dit
 import comfy.model_management
 import comfy.model_prefetch
+import comfy.ops
 import comfy.patcher_extension
+import comfy.quant_ops
+from comfy.ldm.flux.math import apply_rope1
 from comfy.ldm.modules.attention import optimized_attention
 
 
@@ -22,23 +25,23 @@ def timestep_embedding(t, dim=256, max_period=10000):
 
 
 def rope_freqs(sizes, axes_dim, theta, temporal_scale, device):
-    # (cos, sin) of shape [T * H * W, sum(axes_dim)]; only the frame positions are rescaled
+    # interleaved-pair rotations [1, T * H * W, 1, sum(axes_dim) / 2, 2, 2] for (B, N, heads, head_dim), the flux layout;
+    # only the frame positions are rescaled
     grids = torch.meshgrid(*[torch.arange(s, device=device, dtype=torch.float32) for s in sizes], indexing="ij")
-    cos, sin = [], []
+    freqs = []
     for i, dim in enumerate(axes_dim):
         pos = grids[i].reshape(-1)
         if i == 0:
             pos = pos * temporal_scale
-        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device)[: dim // 2] / dim))
-        freqs = torch.outer(pos, freqs)
-        cos.append(freqs.cos().repeat_interleave(2, dim=1))
-        sin.append(freqs.sin().repeat_interleave(2, dim=1))
-    return torch.cat(cos, dim=1), torch.cat(sin, dim=1)
+        freqs.append(torch.outer(pos, 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device)[: dim // 2] / dim))))
+    freqs = torch.cat(freqs, dim=1)
+    cos, sin = freqs.cos(), freqs.sin()
+    return torch.stack([cos, -sin, sin, cos], dim=-1).unflatten(-1, (2, 2))[None, :, None]
 
 
-# The reference runs the rotary embedding, the norms with their shift/scale and the gated residuals in float32 on the
-# whole sequence. Every one of them works on each token by itself, so here they run over slices of the token axis:
-# the same numbers, without several float32 copies of a long video sequence at the same time.
+# The reference runs the norms with their shift/scale and the gated residuals in float32 on the whole sequence. Every
+# one of them works on each token by itself, so here they run over slices of the token axis: the same numbers, without
+# several float32 copies of a long video sequence at the same time.
 TOKEN_CHUNK = 8192
 
 
@@ -51,17 +54,6 @@ def sliced(fn, x, *seq):
         b = a + TOKEN_CHUNK
         out[:, a:b] = fn(x[:, a:b], *[t[:, a:b] for t in seq])
     return out
-
-
-def _rope(x, cos, sin):
-    x_real, x_imag = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)
-    x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
-    return (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
-
-
-def apply_rope(x, pe):
-    # x: [B, S, heads, head_dim]
-    return sliced(_rope, x, pe[0][None, :, None, :], pe[1][None, :, None, :])
 
 
 class FeedForward(nn.Module):
@@ -108,18 +100,23 @@ class Attention(nn.Module):
             self.to_add_out = operations.Linear(dim, dim, bias=bias, **kw)
 
     def forward(self, x, context=None, pe=None, transformer_options={}):
-        q = self.norm_q(self.to_q(x).unflatten(-1, (self.heads, -1)))
-        if pe is not None:  # only the video stream is rotated
-            q = apply_rope(q, pe)
-        if context is not None:
-            q = torch.cat([q, self.norm_added_q(self.add_q_proj(context).unflatten(-1, (self.heads, -1)))], dim=1)
-        k = self.norm_k(self.to_k(x).unflatten(-1, (self.heads, -1)))
-        if pe is not None:
-            k = apply_rope(k, pe)
-        if context is not None:
-            k = torch.cat([k, self.norm_added_k(self.add_k_proj(context).unflatten(-1, (self.heads, -1)))], dim=1)
+        q = self.to_q(x).unflatten(-1, (self.heads, -1))
+        k = self.to_k(x).unflatten(-1, (self.heads, -1))
+        if pe is None:
+            q, k = self.norm_q(q), self.norm_k(k)
+        elif comfy.model_management.in_training:  # only the video stream is rotated
+            q, k = apply_rope1(self.norm_q(q), pe), apply_rope1(self.norm_k(k), pe)
+        else:
+            # fused per-head RMSNorm + rope, in place on the projections
+            q_scale, _, q_stream = comfy.ops.cast_bias_weight(self.norm_q, q, offloadable=True)
+            k_scale, _, k_stream = comfy.ops.cast_bias_weight(self.norm_k, k, offloadable=True)
+            comfy.quant_ops.ck.rms_rope_(q, k, pe, q_scale, k_scale, self.norm_q.eps)
+            comfy.ops.uncast_bias_weight(self.norm_q, q_scale, None, q_stream)
+            comfy.ops.uncast_bias_weight(self.norm_k, k_scale, None, k_stream)
         v = self.to_v(x).unflatten(-1, (self.heads, -1))
         if context is not None:
+            q = torch.cat([q, self.norm_added_q(self.add_q_proj(context).unflatten(-1, (self.heads, -1)))], dim=1)
+            k = torch.cat([k, self.norm_added_k(self.add_k_proj(context).unflatten(-1, (self.heads, -1)))], dim=1)
             v = torch.cat([v, self.add_v_proj(context).unflatten(-1, (self.heads, -1))], dim=1)
         # a node can take over the joint attention (PAN 2 Mem Eff Sage Attention): it gets the only references to
         # q, k and v as [batch, tokens, heads, head_dim] and returns [batch, tokens, dim]
