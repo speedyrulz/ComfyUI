@@ -156,6 +156,7 @@ class AdaLayerNorm(nn.Module):
     def __init__(self, dim, chunks, dtype=None, device=None, operations=None):
         super().__init__()
         self.linear = operations.Linear(dim, chunks * dim, dtype=dtype, device=device)
+        self.linear.comfy_cast_weights = True  # fed the float32 timestep embedding: cast the weights to it even when fully loaded
 
     def forward(self, temb):
         return self.linear(torch.nn.functional.silu(temb))
@@ -213,6 +214,8 @@ class TimestepEmbedding(nn.Module):
         super().__init__()
         self.linear_1 = operations.Linear(in_channels, dim, dtype=dtype, device=device)
         self.linear_2 = operations.Linear(dim, dim, dtype=dtype, device=device)
+        # the modulation runs in float32: cast the weights to the input even when fully loaded
+        self.linear_1.comfy_cast_weights = self.linear_2.comfy_cast_weights = True
 
     def forward(self, x):
         return self.linear_2(torch.nn.functional.silu(self.linear_1(x)))
