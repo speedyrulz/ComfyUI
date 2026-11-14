@@ -504,7 +504,7 @@ class VAE:
         is_seedvr2_vae = "decoder.up_blocks.2.upsamplers.0.upscale_conv.weight" in sd
         if not is_seedvr2_vae and 'decoder.up_blocks.0.resnets.0.norm1.weight' in sd.keys(): #diffusers format
             sd = diffusers_convert.convert_vae_state_dict(sd)
-        if 'decoder.mid_block.resnets.0.norm1.gamma' in sd.keys():  # diffusers AutoencoderKLWan
+        if 'encoder.down_blocks.0.resnets.0.norm1.gamma' in sd.keys():  # diffusers AutoencoderKLWan, Wan 2.2 residual layout
             sd = comfy.ldm.wan.vae2_2.convert_wan_diffusers_vae(sd)
 
         if model_management.is_amd():
