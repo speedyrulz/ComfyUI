@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import sys
@@ -7,6 +8,7 @@ from typing_extensions import override
 
 import comfy.ldm.pan2.forecast
 import comfy.model_management
+import comfy.patcher_extension
 import comfy.utils
 import node_helpers
 import nodes
@@ -213,6 +215,17 @@ class PAN2ImageToVideo(io.ComfyNode):
         return io.NodeOutput(model, positive, negative, {"samples": latent})
 
 
+def spectrum_sample_wrapper(executor, *args, **kwargs):
+    # every sampling run gets a fresh forecaster in the run's copy of the model options, so the kept states go away
+    # when the run ends, also when it is cancelled
+    options = executor.class_obj.model_options["transformer_options"]
+    forecaster = options["pan2_step_forecaster"] = copy.deepcopy(options["pan2_step_forecaster"])
+    try:
+        return executor(*args, **kwargs)
+    finally:
+        forecaster.streams = {}
+
+
 class PAN2Spectrum(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -243,6 +256,7 @@ class PAN2Spectrum(io.ComfyNode):
         options["pan2_step_forecaster"] = comfy.ldm.pan2.forecast.StepForecaster(
             warmup_steps=warmup_steps, window_size=window_size, flex_window=flex_window, degree=degree, ridge=ridge, blend=blend,
             final_steps=final_steps, history_on_gpu=history == "GPU")
+        model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, "pan2_spectrum", spectrum_sample_wrapper)
         return io.NodeOutput(model)
 
 
