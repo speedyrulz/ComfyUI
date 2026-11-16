@@ -44,26 +44,6 @@ def calculate_transformer_depth(prefix, state_dict_keys, state_dict):
 def detect_unet_config(state_dict, key_prefix, metadata=None):
     state_dict_keys = list(state_dict.keys())
 
-    if '{}transformer_blocks.0.scale_shift_table_context'.format(key_prefix) in state_dict_keys and '{}context_refiner.0.attn.to_q.weight'.format(key_prefix) in state_dict_keys:  # PAN 2
-        dit_config = {}
-        dit_config["image_model"] = "pan2"
-        x_embedder = state_dict['{}x_embedder.weight'.format(key_prefix)]
-        dim = x_embedder.shape[0]
-        head_dim = state_dict['{}transformer_blocks.0.attn.norm_q.weight'.format(key_prefix)].shape[0]
-        dit_config["in_channels"] = x_embedder.shape[1]
-        dit_config["patch_size"] = list(x_embedder.shape[2:])
-        dit_config["out_channels"] = state_dict['{}proj_out.bias'.format(key_prefix)].shape[0] // math.prod(x_embedder.shape[2:])
-        dit_config["attention_head_dim"] = head_dim
-        dit_config["num_attention_heads"] = dim // head_dim
-        dit_config["num_layers"] = count_blocks(state_dict_keys, '{}transformer_blocks.'.format(key_prefix) + '{}.')
-        dit_config["num_refiner_layers"] = count_blocks(state_dict_keys, '{}context_refiner.'.format(key_prefix) + '{}.')
-        # out features, which quantized (packed) weights keep in shape[0]
-        dit_config["mlp_ratio"] = state_dict['{}transformer_blocks.0.ff.net.0.proj.bias'.format(key_prefix)].shape[0] / dim
-        dit_config["context_mlp_ratio"] = state_dict['{}transformer_blocks.0.ff_context.net.0.proj.bias'.format(key_prefix)].shape[0] / dim
-        dit_config["refiner_mlp_ratio"] = state_dict['{}context_refiner.0.ff.net.0.proj.weight'.format(key_prefix)].shape[0] / (2 * dim)
-        dit_config["text_embed_dim"] = state_dict['{}context_embedder.0.weight'.format(key_prefix)].shape[0]
-        return dit_config
-
     if (
         '{}cond_layer_logits'.format(key_prefix) in state_dict_keys
         and '{}latent_conditioners.0.weight'.format(key_prefix) in state_dict_keys
@@ -1075,6 +1055,21 @@ def detect_unet_config(state_dict, key_prefix, metadata=None):
         dit_config["num_heads"] = dit_config["dim"] // 128
         dit_config["num_layers"] = count_blocks(state_dict_keys, '{}layers.'.format(key_prefix) + '{}.')
         dit_config["fused_qkv"] = '{}layers.0.proj.qkv.weight'.format(key_prefix) in state_dict_keys
+        return dit_config
+
+    if '{}transformer_blocks.0.scale_shift_table_context'.format(key_prefix) in state_dict_keys and '{}transformer_blocks.0.ff.net.0.proj.weight'.format(key_prefix) in state_dict_keys and '{}transformer_blocks.0.ff_context.net.0.proj.weight'.format(key_prefix) in state_dict_keys and '{}x_embedder.weight'.format(key_prefix) in state_dict_keys:  # PAN 2
+        dit_config = {}
+        dit_config["image_model"] = "pan2"
+        dit_config["in_channels"] = state_dict['{}x_embedder.weight'.format(key_prefix)].shape[1]
+        dim = state_dict['{}x_embedder.weight'.format(key_prefix)].shape[0]
+        dit_config["dim"] = dim
+        dit_config["num_heads"] = dim // 128
+        dit_config["mlp_ratio"] = state_dict['{}transformer_blocks.0.ff.net.0.proj.weight'.format(key_prefix)].shape[0] / dim
+        dit_config["context_mlp_ratio"] = state_dict['{}transformer_blocks.0.ff_context.net.0.proj.weight'.format(key_prefix)].shape[0] / dim
+        dit_config["num_layers"] = count_blocks(state_dict_keys, '{}transformer_blocks.'.format(key_prefix) + '{}.')
+        table_key = '{}adaln_t_table'.format(key_prefix)
+        if table_key in state_dict_keys:  # adaln over a precomputed basis of the time-embedding curve, no time embedder
+            dit_config["adaln_curve_grid"], dit_config["adaln_curve_dim"] = state_dict[table_key].shape
         return dit_config
 
     if '{}txtfusion.projector.weight'.format(key_prefix) in state_dict_keys:  # Krea 2 (K2)

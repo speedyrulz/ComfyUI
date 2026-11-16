@@ -2,7 +2,7 @@
 
 # ComfyUI — speedyrulz fork
 
-**A fork of [Comfy-Org/ComfyUI](https://github.com/Comfy-Org/ComfyUI) with PAN 2 video support and a few speed, memory and bug fixes.**
+**A fork of [Comfy-Org/ComfyUI](https://github.com/Comfy-Org/ComfyUI) with a few speed, memory and bug fixes.**
 
 [Wiki](https://github.com/speedyrulz/ComfyUI/wiki) · [Fork changes](https://github.com/speedyrulz/ComfyUI/wiki/Fork-Changes) · [Installation](https://github.com/speedyrulz/ComfyUI/wiki/Installation) · [Upstream](https://github.com/Comfy-Org/ComfyUI) · [Docs](https://docs.comfy.org)
 
@@ -17,8 +17,7 @@ This fork follows upstream `master` and is merged with it regularly, so it has e
 
 | Area | Change | Details |
 |---|---|---|
-| **PAN 2** | Text-to-video and image-to-video with IFM's [PAN 2](https://huggingface.co/IFM/PAN2) (about 29B parameters), through the standard loaders and samplers, plus nodes for prompts that stay as written, the released negative prompt, and first-frame conditioning | [PAN 2](https://github.com/speedyrulz/ComfyUI/wiki/PAN-2) |
-| **PAN 2 speed** | Spectrum step forecasting (sampling in 58 s instead of 149 s at 50 steps in testing), a memory-efficient Sage attention node (25.7 s instead of 42.6 s per step), token-sliced float32 math, and a fused RMSNorm + RoPE kernel | [PAN 2 Speed and Memory](https://github.com/speedyrulz/ComfyUI/wiki/PAN-2-Speed-and-Memory) |
+| **PAN 2 loading** | PAN 2 is now supported upstream; this fork also loads text encoders in the transformers Qwen3_5TextModel layout and Wan VAEs in the diffusers AutoencoderKLWan layout | |
 | **Qwen-Image 2.1** | Reference images are encoded once and shared by the positive and negative prompts, instead of twice | [Prompt Encoding](https://github.com/speedyrulz/ComfyUI/wiki/Qwen-Image-Prompt-Encoding) |
 | **WSL2 and multi-GPU** | The Windows pinned-memory budget under WSL2, and locking so two GPUs can stream weights at the same time | [Pinned Memory and Multi-GPU](https://github.com/speedyrulz/ComfyUI/wiki/Pinned-Memory-and-Multi-GPU) |
 | **Loading** | Qwen3.5 text encoders in the transformers layout, and Wan 2.2 VAEs in the diffusers layout | [Fork Changes](https://github.com/speedyrulz/ComfyUI/wiki/Fork-Changes#loading) |
@@ -46,7 +45,7 @@ Then open http://127.0.0.1:8188. For AMD, Intel, Apple silicon and other hardwar
 Everything upstream ComfyUI offers, including:
 
 - A visual node graph for image, video, audio, 3D and text workflows, with reusable subgraphs, templates, App Mode and a local API.
-- Native support for current open models: Flux.2, Qwen Image, Wan 2.2, LTX-Video 2, HunyuanVideo 1.5, MiniMax H3, ACE-Step and many more, plus PAN 2 in this fork ([full list](https://github.com/speedyrulz/ComfyUI/wiki/Using-ComfyUI#what-comfyui-supports)).
+- Native support for current open models: Flux.2, Qwen Image, Wan 2.2, LTX-Video 2, HunyuanVideo 1.5, MiniMax H3, PAN 2, ACE-Step and many more ([full list](https://github.com/speedyrulz/ComfyUI/wiki/Using-ComfyUI#what-comfyui-supports)).
 - Efficient local execution: only changed parts of a graph re-run, smart VRAM and RAM management, weight streaming, and quantized models.
 - Runs fully offline: the core downloads nothing unless you ask it to.
 - Custom nodes, extra model paths, and high bit depth and HDR image and video formats.
