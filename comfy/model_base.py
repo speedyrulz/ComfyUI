@@ -2945,51 +2945,6 @@ class Krea2(BaseModel):
             out['ref_latents'] = list([1, 16, sum(map(lambda a: math.prod(a.size()), ref_latents)) // 16])
         return out
 
-class PAN2(BaseModel):
-    def __init__(self, model_config, model_type=ModelType.FLOW, device=None):
-        super().__init__(model_config, model_type, device=device, unet_model=comfy.ldm.pan2.model.PAN2Transformer3DModel)
-
-    def concat_cond(self, **kwargs):
-        # 48 conditioning latent channels and 1 mask channel (1 = this latent frame is given), zeros for text-to-video
-        noise = kwargs.get("noise", None)
-        extra_channels = self.diffusion_model.x_embedder.weight.shape[1] - noise.shape[1]
-        if extra_channels == 0:
-            return None
-        cond = torch.zeros([noise.shape[0], extra_channels] + list(noise.shape[2:]), dtype=noise.dtype, layout=noise.layout, device=noise.device)
-        image = kwargs.get("concat_latent_image", None)
-        if image is None:
-            return cond
-
-        device = kwargs["device"]
-        latent_dim = self.latent_format.latent_channels
-        image = utils.common_upscale(image.to(device), noise.shape[-1], noise.shape[-2], "bilinear", "center")
-        image = utils.resize_to_batch_size(self.process_latent_in(image[:, :latent_dim]), noise.shape[0])
-        frames = min(image.shape[2], noise.shape[2])
-
-        mask = kwargs.get("concat_mask", kwargs.get("denoise_mask", None))
-        given = torch.zeros([noise.shape[0], 1] + list(noise.shape[2:]), dtype=noise.dtype, device=noise.device)
-        if mask is None:
-            given[:, :, :frames] = 1.0
-        else:  # ComfyUI masks mark what is generated
-            if mask.shape[1] != 1:
-                mask = torch.mean(mask, dim=1, keepdim=True)
-            mask = utils.common_upscale(1.0 - mask.to(device), noise.shape[-1], noise.shape[-2], "bilinear", "center")
-            mask = utils.resize_to_batch_size(mask, noise.shape[0])
-            n = min(mask.shape[2], frames)
-            given[:, :, :n] = mask[:, :, :n]
-
-        cond[:, :latent_dim, :frames] = image[:, :, :frames].to(cond) * given[:, :, :frames]
-        cond[:, latent_dim:latent_dim + 1] = given
-        return cond
-
-    def extra_conds(self, **kwargs):
-        out = super().extra_conds(**kwargs)
-        cross_attn = kwargs.get("cross_attn", None)
-        # no padding: prompts of different lengths run as separate sequences, as in the reference
-        if cross_attn is not None:
-            out['c_crossattn'] = comfy.conds.CONDRegular(cross_attn)
-        return out
-
 class MOSSImage(BaseModel):
     def __init__(self, model_config, model_type=ModelType.FLOW, device=None):
         super().__init__(model_config, model_type, device=device, unet_model=comfy.ldm.moss_image.model.MOSSImage)
@@ -3038,6 +2993,27 @@ class MOSSImage(BaseModel):
             return noise.new_zeros((noise.shape[0], channels) + noise.shape[2:])
         image = utils.common_upscale(image.to(kwargs["device"]), noise.shape[-1], noise.shape[-2], "bilinear", "center")
         return utils.resize_to_batch_size(self.process_latent_in(image), noise.shape[0])
+
+class PAN2(BaseModel):
+    def __init__(self, model_config, model_type=ModelType.FLOW, device=None):
+        super().__init__(model_config, model_type, device=device, unet_model=comfy.ldm.pan2.model.PAN2)
+
+    def extra_conds(self, **kwargs):
+        out = super().extra_conds(**kwargs)
+        cross_attn = kwargs.get("cross_attn", None)
+        # no repeat padding, the joint attention would weight repeated caption tokens: cond and uncond of different lengths run separately
+        if cross_attn is not None:
+            out['c_crossattn'] = comfy.conds.CONDRegular(cross_attn)
+        return out
+
+    def concat_cond(self, **kwargs):
+        # [clean latent of the known frames, their mask], zeros for text to video
+        noise = kwargs["noise"]
+        denoise_mask = kwargs.get("denoise_mask", None)
+        if denoise_mask is None:
+            return noise.new_zeros((noise.shape[0], noise.shape[1] + 1) + noise.shape[2:])
+        known = 1.0 - denoise_mask[:, :1]
+        return torch.cat((kwargs["latent_image"] * known, known), dim=1)
 
 class Fibo2(BaseModel):
     def __init__(self, model_config, model_type=ModelType.FLUX, device=None):
