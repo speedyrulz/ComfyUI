@@ -225,15 +225,18 @@ class Server:
     async def gpus(self):
         return [d for d in (await self.get("/system_stats"))["devices"] if d["type"] != "cpu"]
 
-    async def free(self):
-        """Unload models and clear the cache, then return VRAM in use per GPU once it settles."""
+    async def free(self, idle=None):
+        """Unload models and clear the cache, then return VRAM in use per GPU once it settles.
+
+        With idle (VRAM in use per GPU after an earlier free), also wait until every GPU is back near it.
+        """
         await self.post("/free", {"unload_models": True, "free_memory": True})
-        # A prompt queued before the worker picks up the flags would run before the unload.
         used = {}
-        for i in range(40):
+        for i in range(60):
             await asyncio.sleep(0.5)
             now = {d["index"]: d["vram_total"] - d["vram_free"] for d in await self.gpus()}
-            if i >= 2 and all(abs(now[k] - used.get(k, 0)) < 64 * 1024 ** 2 for k in now):
+            settled = i >= 2 and all(abs(now[k] - used.get(k, 0)) < 64 * 1024 ** 2 for k in now)
+            if settled and (idle is None or all(now[k] < idle.get(k, 0) + GIB / 2 for k in now)):
                 break
             used = now
         return now
@@ -428,7 +431,7 @@ async def benchmark(args, graph, out_dir):
                   "set": args.set, "runs": args.runs, "notes": args.notes, "gpus": gpus, "loaders": loaders, "variants": results}
         for i, (name, placement) in enumerate(variants, 1):
             print(f"[{i}/{len(variants)}] {name}")
-            idle_vram = await server.free()
+            idle_vram = await server.free(report.get("idle_vram"))
             if i == 1:
                 report["idle_vram"] = idle_vram
             variant_graph = apply_placement(graph, loaders, placement)
