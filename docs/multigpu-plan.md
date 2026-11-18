@@ -116,7 +116,8 @@ Missing: batch and context-window splitting, automatic placement, thread safety 
 #### Results
 
 - **Krea 2 T2I + 2x iterative upscale, 1 warm run (2026-11-14):** baseline 84.3 s warm, 161 s cold. Text encoder and VAE on the 4060 Ti: 82.5 s warm, 140 s cold. The 4060 Ti peaked at 3.7 GiB, which confirms the move.
-- **H3 t2v at 8 steps (`--set 160.value=8`), 1 warm run (2026-11-14):** baseline 261 s warm (sampler 223, PE 13, TE encode 9, VAE decode 8). TE on the 4060 Ti: encode 9 → 22 s, sampler −6 s, a net loss. VAE on the 4060 Ti: decode 7.9 → 10.3 s, a net loss. Diffusion model on the 4060 Ti: sampler 307 s (r ≈ 1.38). PE on the 4060 Ti failed, and the TE result is invalid (both: see the fix below). Re-run the H3 sweep.
+- **H3 t2v at 8 steps (`--set 160.value=8`), re-run with the Select CLIP Device fix (2026-11-18):** `user/default/workflows/video_minimax_h3_t2v.json`, converted to API format by hand. Each run is about 51 s of TE encode, sampler and decode, plus the PE, which took 21-58 s depending on output length. With 3 warm runs, the time outside the PE was the same for every placement: baseline 51.0 s, H3 TE + VAEs on the 4060 Ti 51.2 s, both text encoders on the 4060 Ti 51.9 s. The sampler took 38-42 s and the TE encode 5-7 s in all three. The H3 TE on the 4060 Ti is no longer slower: the old 9 → 22 s was the bug. The PE is about 6 s slower on the 4060 Ti (43 vs 37 s with the same seeds). The first warm run after moving a text encoder to the 4060 Ti costs about 25 s more (sampler ~51 s, TE ~14 s); later runs don't. **Conclusion:** no placement beats everything on the 5060 Ti for this workflow. The DiT stays mostly resident either way. The diffusion model on the 4060 Ti was not re-run (the bug did not affect it; r ≈ 1.38 on 2026-11-14).
+- **Run order:** the first variant's cold run includes reading the files from disk (180 s vs 103-159 s for later cold runs), because `/free` does not clear the OS page cache. Compare warm runs only. In one sweep, 9.2 GiB stayed in use on the 4060 Ti after `/free` following a variant that placed the PE and VAEs there; a later `/free` cleared it. Watch for this in Stage 2.
 - **Noise:** PE time varied 13-48 s on the same GPU because MTP "auto" makes the output length vary. Use `--runs 3` and compare the node table.
 - **Two workers, Krea 2 (2026-11-16):** 5 jobs on the 5060 Ti alone took 395 s (median 78 s per job). 5 jobs across both servers, each taking the next job when free, took 220 s: **1.80x**, or about 1.89x for a long queue. While both ran, the median job took 72 s on the 5060 Ti and 97 s on the 4060 Ti; an earlier run measured 127 s on the 4060 Ti, so r on this workflow is somewhere between 1.3 and 1.6. Round-robin dispatch of 4 jobs gave only 1.33x, because the slower card set the wall time.
 
@@ -126,7 +127,7 @@ Text generation on the non-default GPU through Select CLIP Device crashed in `cu
 
 - Qwen3.5 PE w4a8 on the 4060 Ti, 64 tokens warm: 125 s before, 3.2 s after (2.0 s on the 5060 Ti; 2.2 s when loaded directly on `cuda:1`).
 - PE (128 tokens) plus Krea TE encode, `--runs 3`: baseline 3.0 s; PE on the 4060 Ti 4.9 s (generate 2.4 → 4.0 s); Krea TE on the 4060 Ti 4.3 s; both 6.5 s.
-- Every earlier text-encoder-on-the-4060-Ti result ran the stale model, including the H3 TE (9 → 22 s) and the Krea TE + VAE variant. Re-measure them.
+- Every earlier text-encoder-on-the-4060-Ti result ran the stale model. H3 has been re-measured (above); the Krea TE + VAE variant has not.
 
 ### Stage 2: `--multigpu` and a placement plan
 
