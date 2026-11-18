@@ -116,20 +116,17 @@ Missing: batch and context-window splitting, automatic placement, thread safety 
 #### Results
 
 - **Krea 2 T2I + 2x iterative upscale, 1 warm run (2026-11-14):** baseline 84.3 s warm, 161 s cold. Text encoder and VAE on the 4060 Ti: 82.5 s warm, 140 s cold. The 4060 Ti peaked at 3.7 GiB, which confirms the move.
-- **H3 t2v at 8 steps (`--set 160.value=8`), 1 warm run (2026-11-14):** baseline 261 s warm (sampler 223, PE 13, TE encode 9, VAE decode 8). TE on the 4060 Ti: encode 9 → 22 s, sampler −6 s, a net loss. VAE on the 4060 Ti: decode 7.9 → 10.3 s, a net loss. Diffusion model on the 4060 Ti: sampler 307 s (r ≈ 1.38). PE on the 4060 Ti fails (below). Today the best H3 placement is everything on the 5060 Ti.
+- **H3 t2v at 8 steps (`--set 160.value=8`), 1 warm run (2026-11-14):** baseline 261 s warm (sampler 223, PE 13, TE encode 9, VAE decode 8). TE on the 4060 Ti: encode 9 → 22 s, sampler −6 s, a net loss. VAE on the 4060 Ti: decode 7.9 → 10.3 s, a net loss. Diffusion model on the 4060 Ti: sampler 307 s (r ≈ 1.38). PE on the 4060 Ti failed, and the TE result is invalid (both: see the fix below). Re-run the H3 sweep.
 - **Noise:** PE time varied 13-48 s on the same GPU because MTP "auto" makes the output length vary. Use `--runs 3` and compare the node table.
 - **Two workers, Krea 2 (2026-11-16):** 5 jobs on the 5060 Ti alone took 395 s (median 78 s per job). 5 jobs across both servers, each taking the next job when free, took 220 s: **1.80x**, or about 1.89x for a long queue. While both ran, the median job took 72 s on the 5060 Ti and 97 s on the 4060 Ti; an earlier run measured 127 s on the 4060 Ti, so r on this workflow is somewhere between 1.3 and 1.6. Round-robin dispatch of 4 jobs gave only 1.33x, because the slower card set the wall time.
 
-#### Blocker for Stage 2: text generation on the second GPU
+#### Fixed: text encoders on the second GPU ran the old model (2026-11-18)
 
-Text generation (Qwen3.5 PE through core `TextGenerateV2` or WAS Fast Generate Text) on the non-default GPU through Select CLIP Device either crashes with `CUDA error: invalid argument` (`Unable to access operand ... in the specified context`) in `cuMemcpyHtoDAsync`, or stalls at 60-90 s per token with both GPUs idle. The crash path is `qwen35.py _generate_mtp` → `model_prefetch.prefetch_queue_pop` → `pin_modules` → `ops.cast_modules_with_vbar` → `model_management.cast_to_gathered`.
+Text generation on the non-default GPU through Select CLIP Device crashed in `cuMemcpyHtoDAsync` (`Unable to access operand ... in the specified context`) or stalled at 60-90 s per token. Cause: the node replaced `clip.patcher` with a deepclone loaded on the new device but left `clip.cond_stage_model` pointing at the original model, which `CLIP.encode` and `CLIP.generate` run. The node now points `cond_stage_model` at the clone's model, as Select VAE Device already did.
 
-- Happens with MTP on and off. H3 TE encoding on the second GPU works.
-- The same model generates normally (24.6 s cold) when the 4060 Ti is the only visible GPU.
-- Pins are registered portable, `CLIP.generate` already runs in `cuda_device_context`, and VBARs and pin state are kept per load device (`dynamic_vbars`, `dynamic_pins`).
-- Select CLIP Device builds the reloaded model for `cuda:0` through `cached_patcher_init`, then retargets it to `cuda:1`. Loading directly on the target device (`model_options["load_device"]`), as Stage 2 plans, may avoid the bug.
-
-Stage 2 starts by reproducing this with a standalone load on `cuda:1`.
+- Qwen3.5 PE w4a8 on the 4060 Ti, 64 tokens warm: 125 s before, 3.2 s after (2.0 s on the 5060 Ti; 2.2 s when loaded directly on `cuda:1`).
+- PE (128 tokens) plus Krea TE encode, `--runs 3`: baseline 3.0 s; PE on the 4060 Ti 4.9 s (generate 2.4 → 4.0 s); Krea TE on the 4060 Ti 4.3 s; both 6.5 s.
+- Every earlier text-encoder-on-the-4060-Ti result ran the stale model, including the H3 TE (9 → 22 s) and the Krea TE + VAE variant. Re-measure them.
 
 ### Stage 2: `--multigpu` and a placement plan
 
