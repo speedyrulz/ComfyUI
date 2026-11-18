@@ -273,6 +273,8 @@ class SelectCLIPDeviceNode(io.ComfyNode):
             return io.NodeOutput(clip)
         try:
             clip.patcher = _apply_patcher_device(clip.patcher, resolved)
+            # deepclone_multigpu gives the patcher a fresh model; encode/generate run cond_stage_model.
+            clip.cond_stage_model = clip.patcher.model
         except RuntimeError as e:
             logging.warning(f"Select CLIP Device: cannot retarget CLIP, passing through unchanged. ({e})")
         return io.NodeOutput(clip)
