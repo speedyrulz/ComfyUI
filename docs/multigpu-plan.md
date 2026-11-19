@@ -170,6 +170,21 @@ Both parts reuse the existing per-GPU threads and model clones from MultiGPU CFG
 
 **4b. Context-window split (long video).** `IndexListContextHandler.execute()` evaluates windows one by one. Hand each GPU a share of the windows per step, weighted by speed, with its own copy of `transformer_options` (it currently writes `context_window` into a shared dict). Then combine the results on the main thread in window order, so output does not depend on thread timing. Expected ≈ 2/r for an even window count, about 1.37x at H3's ratio. Check upstream first, given the unused `device` parameters.
 
+**Long H3 video measurements (2026-11-18), single GPU (5060 Ti).** `video_minimax_h3_t2v.json` as text-to-video with a neutral prompt, 4-step turbo LoRA (v1.3, strength 1.0), 0.25 MP (448x576), Spectrum off. H3's trained range is 124-362 frames (5-15 s). Context windows use the existing MiniMax H3 Context Windows node (upstream #17425); upstream has no multi-GPU window work.
+
+| Length | Sampler | VAE decode | CreateVideo | Notes |
+|---|---|---|---|---|
+| 5 s | 28.1 s | 5.1 s | 9.1 s | |
+| 10 s | 51.0 s | 4.1 s | 4.8 s | |
+| 15 s | 81.8 s | 7.2 s | 15.5 s | clean: same person and clothes throughout |
+| 25 s, single pass | 166.2 s | 38.8 s | 58.4 s | consistent identity, but smeared, melting clothing in many frames |
+| 25 s, windows 243 / overlap 39 (3 windows) | 161.8 s | 26.7 s | 72.0 s | sharp, but clothing changes at the window starts (dark trousers → jeans near 10 s) |
+
+- Sampler time grows about linearly with length (5.1-6.6 s per second of video). With sparse attention at 0.25 MP, windows save no time over a single pass; their value is quality past 15 s.
+- Audio is continuous across window starts (no dropouts in the loudness trace); speech quality not yet judged.
+- At 25 s, VAE decode plus CreateVideo take 85-100 s, about a third of the run. That is a single-GPU target worth checking before splitting windows.
+- Window split estimate: 3 windows per step split 2 + 1 (the 4060 Ti takes one) gives step time 2w instead of 3w, about 1.5x on the sampler only. It needs a second 21 GB DiT copy in RAM, and WSL can pin only ~40% of RAM.
+
 **Test:** Qwen and H3 at batch 2 and 4; a long H3 video with Context Windows. Work done on the primary must be bit-identical to single-GPU output. Also check VRAM and RAM with two model copies, interrupt during a split, and the patch nodes (Spectrum, BlockSparseAttention, Qwen cache, RulZ sparse) on the cloned model.
 **Size:** medium, in `samplers.py`, `conds.py`, `context_windows.py` and `multigpu.py`.
 
