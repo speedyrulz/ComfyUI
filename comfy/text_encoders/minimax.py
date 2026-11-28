@@ -20,12 +20,21 @@ output with no final norm). Vision-pad positions carry adaLN token tag 0
 returned alongside the embeddings as "minimax_token_tags".
 """
 
+import hashlib
+import logging
+import numbers
+import os
+
 import torch
 import torch.nn.functional as F
+import comfy.model_management
 import comfy.ops
 import comfy.sd1_clip
 from .qwen3vl import Qwen3VL, Qwen3VLSDTokenizer
-from .qwen_vl import smart_resize
+from .qwen_vl import smart_resize, process_qwen2vl_images
+
+# Persistent prefix cache (see MiniMaxH3ClipModel.forward). Set COMFY_MINIMAX_PREFIX_CACHE=0 to disable.
+PREFIX_CACHE = os.environ.get("COMFY_MINIMAX_PREFIX_CACHE", "1") != "0"
 
 VISION_START = 151652
 VISION_END = 151653
@@ -79,12 +88,33 @@ def token_tags_from_embeds_info(seq_len, embeds_info):
 class MiniMaxQwen3VL(Qwen3VL):
     model_type = "qwen3vl_32b"
 
+    def vision_dtype(self):
+        # bf16 vision weights run the tower in bf16 (as the transformers reference does); anything else (fp16 can
+        # overflow in the tower, fp32) stays fp32. The text-encoder ops cast weights to the input dtype.
+        if self.visual.patch_embed.proj.weight.dtype == torch.bfloat16:
+            return torch.bfloat16
+        return torch.float32
+
     def preprocess_embed(self, embed, device):
-        if embed["type"] == "image" and embed.get("minimax_video_block", False):
-            flatten, grid = process_video_block(embed["data"])
-            merged, deepstack = self.visual(flatten.to(device, dtype=torch.float32), grid)
-            return merged, {"grid": grid, "deepstack": deepstack}
-        return super().preprocess_embed(embed, device)
+        if embed["type"] != "image":
+            return None, None
+        data = embed["data"]
+        # optional {id(data): (data, merged, extra)} set by a caller that encodes the same images more than once
+        cache = self.vision_cache
+        if cache is not None:
+            hit = cache.get(id(data))
+            if hit is not None and hit[0] is data:
+                return hit[1], hit[2]
+        if embed.get("minimax_video_block", False):
+            flatten, grid = process_video_block(data)
+        else:
+            # Qwen3-VL normalizes to [-1, 1] (mean/std 0.5)
+            flatten, grid = process_qwen2vl_images(data, patch_size=16, image_mean=QWEN_IMAGE_MEAN, image_std=QWEN_IMAGE_STD)
+        merged, deepstack = self.visual(flatten.to(device, dtype=self.vision_dtype()), grid)
+        extra = {"grid": grid, "deepstack": deepstack}
+        if cache is not None:
+            cache[id(data)] = (data, merged, extra)
+        return merged, extra
 
     def forward(self, input_ids, attention_mask=None, embeds=None, num_tokens=None,
                 intermediate_output=None, final_layer_norm_intermediate=True,
@@ -126,9 +156,11 @@ class PH3ImageQwen3VL(MiniMaxQwen3VL):
         self.text_connector = TextConnector(len(PH3_IMAGE_HIDDEN_STATES) * self.model.config.hidden_size, PH3_IMAGE_TEXT_DIM,
                                             dtype=torch.float32, device=device, operations=comfy.ops.manual_cast)
 
-    def forward(self, *args, **kwargs):
-        x, hidden_states = super().forward(*args, **kwargs)
-        return x, self.text_connector(hidden_states)
+    def forward(self, *args, apply_connector=True, **kwargs):
+        out = super().forward(*args, **kwargs)
+        if not apply_connector:  # the prefix cache joins prefix and suffix states first: the connector replaces token 0 with a sink
+            return out
+        return (out[0], self.text_connector(out[1])) + tuple(out[2:])
 
 
 class MiniMaxH3ClipModel(comfy.sd1_clip.SDClipModel):
@@ -137,6 +169,156 @@ class MiniMaxH3ClipModel(comfy.sd1_clip.SDClipModel):
                          dtype=dtype, special_tokens={"pad": 151643}, layer_norm_hidden_state=False,
                          model_class=model_class, enable_attention_masks=False,
                          return_attention_masks=False, model_options=model_options)
+
+        self.patch_state = None  # the weight-patch signal of the owning TE wrapper (see PatchStateMixin)
+        self.weight_hooks = False  # CLIP hooks patch weights without changing patch_state: no prefix cache then
+        self.prefix_cache_status = "off"  # "hit", "miss", "fallback" or "off" for the last encode
+        self._prefix_cache = None  # the single entry, see forward
+
+    def set_clip_options(self, options):
+        super().set_clip_options(options)
+        self.weight_hooks = options.get("weight_hooks", self.weight_hooks)
+
+    def reset_clip_options(self):
+        super().reset_clip_options()
+        self.weight_hooks = False
+
+    def load_sd(self, sd):
+        self._prefix_cache = None
+        return super().load_sd(sd)
+
+    # ---- persistent prefix cache -------------------------------------------------------------------------------
+    # Every H3 layout puts the reference vision blocks first and the prompt last, and the LM is causal, so the hidden
+    # states / intermediates / KV of everything up to the last <|vision_end|> do not depend on the prompt. One entry,
+    # keyed by content (the conditioning nodes rebuild the image tensors on every run), survives between executions:
+    # re-encoding the same references with a new prompt skips the vision tower and the prefix LM pass.
+    # Size, kept on intermediate_device() (CPU) between encodes: fp32 KV is 2 * kv_heads * head_dim * layers * 4 bytes
+    # per prefix token (32B: 8 * 128 * 50 -> ~0.4 MB/token, so ~1.2 GB for three 1k-token images), plus 20 KB/token
+    # (32B last state) or 51 KB/token (PH3: 5 raw intermediates) of outputs.
+
+    @staticmethod
+    def _hash_tensor(t, h):
+        t = t.detach().contiguous().cpu()
+        h.update(repr((tuple(t.shape), str(t.dtype))).encode())
+        if t.numel() > 0:
+            h.update(memoryview(t.reshape(-1).view(torch.uint8).numpy()))
+
+    def _prefix_key(self, head):
+        # content key of the prefix tokens, or None when an entry is not something we can hash
+        h = hashlib.blake2b(digest_size=32)
+        h.update(repr((type(self.transformer).__name__, repr(self.layer), str(self.patch_state))).encode())
+        for t in head:
+            if isinstance(t, numbers.Integral):
+                h.update(b"i%d;" % int(t))
+                continue
+            if isinstance(t, dict):
+                data = t.get("data")
+                h.update(("d:%s:%s:" % (t.get("type"), bool(t.get("minimax_video_block", False)))).encode())
+            else:
+                data = t
+                h.update(b"t:")
+            if not torch.is_tensor(data):
+                return None
+            self._hash_tensor(data, h)
+        return h.digest()
+
+    def _prefix_end(self, tokens):
+        # index of the <|vision_end|> after the last vision block, or None when the prefix cache does not apply
+        if len(tokens) != 1 or not (self.layer == "last" or isinstance(self.layer, list)):
+            return None
+        entries = tokens[0]
+        last = max((i for i, t in enumerate(entries) if isinstance(t, dict) and t.get("type") == "image"), default=-1)
+        if last < 0 or last + 2 >= len(entries):
+            return None
+        end = entries[last + 1]
+        if not isinstance(end, numbers.Integral) or int(end) != VISION_END:
+            return None
+        if not any(isinstance(t, numbers.Integral) for t in entries[last + 2:]):
+            return None
+        return last + 1
+
+    def _run(self, embeds, embeds_info, raw=False, **kwargs):
+        if raw and hasattr(self.transformer, "text_connector"):
+            kwargs["apply_connector"] = False
+        intermediate_output = self.layer if isinstance(self.layer, list) else self.layer_idx
+        return self.transformer(None, None, embeds=embeds, intermediate_output=intermediate_output,
+                                final_layer_norm_intermediate=self.layer_norm_hidden_state, dtype=torch.float32,
+                                embeds_info=embeds_info, **kwargs)
+
+    def _plain(self, tokens, status):
+        self.prefix_cache_status = status
+        return super().forward(tokens)
+
+    def forward(self, tokens):
+        if not PREFIX_CACHE:
+            self._prefix_cache = None
+            return self._plain(tokens, "off")
+        end = None if self.weight_hooks else self._prefix_end(tokens)
+        if end is None:
+            return self._plain(tokens, "fallback")
+        head = tokens[0][:end + 1]
+        key = self._prefix_key(head)
+        if key is None:
+            return self._plain(tokens, "fallback")
+
+        device = self.execution_device
+        if device is None:
+            device = self.transformer.get_input_embeddings().weight.device
+        store_device = comfy.model_management.intermediate_device()
+        entry = self._prefix_cache
+        if entry is not None and entry["key"] != key:
+            entry = self._prefix_cache = None  # release the old KV before the new one is built
+
+        if entry is not None:  # hit: no vision tower, no prefix pass; only the prompt text is embedded and run
+            suffix = tokens[0][end + 1:]
+            embeds, _, _, embeds_info = self.process_tokens([suffix], device)
+            n = embeds.shape[1]
+            first = entry["first_pos"]
+            position_ids = torch.arange(first, first + n, device=device, dtype=torch.float32).unsqueeze(0).repeat(3, 1)
+            kv = [(k.to(device), v.to(device), entry["prefix_len"]) for k, v in entry["kv"]]
+            out = self._run(embeds, embeds_info, raw=True, position_ids=position_ids, past_key_values=kv)
+            prefix = entry["states"].to(device)
+            status = "hit"
+            prefix_tags = entry["tags"]
+            seq = entry["prefix_len"] + n
+        else:  # miss: the whole sequence's inputs, then the prefix pass (filling an exact-size KV) and the suffix pass
+            embeds, _, num_tokens, embeds_info = self.process_tokens(tokens, device)
+            images = [e for e in embeds_info if e.get("type") == "image"]
+            n_vision = sum(1 for t in head if isinstance(t, dict) and t.get("type") == "image")
+            prefix_len = images[-1]["index"] + images[-1]["size"] + 1 if images else 0
+            if len(images) != n_vision or prefix_len == 0 or prefix_len >= embeds.shape[1]:
+                self.prefix_cache_status = "fallback"
+                outputs = self._run(embeds, embeds_info, num_tokens=num_tokens)
+                z = (outputs[0] if self.layer == "last" else outputs[1]).float()
+                return z, None
+            seq = embeds.shape[1]
+            position_ids, visual_pos_masks, deepstack = self.transformer.build_image_inputs(embeds, embeds_info)
+            cfg = self.transformer.model.config
+            shape = (1, cfg.num_key_value_heads, prefix_len, cfg.head_dim)
+            past = [(torch.empty(shape, device=embeds.device, dtype=embeds.dtype), torch.empty(shape, device=embeds.device, dtype=embeds.dtype), 0)
+                    for _ in range(self.transformer.num_layers)]
+            pre = self._run(embeds[:, :prefix_len], embeds_info, raw=True, position_ids=position_ids[..., :prefix_len],
+                            visual_pos_masks=visual_pos_masks[:, :prefix_len], deepstack_embeds=deepstack, past_key_values=past)
+            kv = pre[2]  # exactly prefix_len long: the suffix attention concatenates onto it and never writes into it
+            out = self._run(embeds[:, prefix_len:], embeds_info, raw=True, position_ids=position_ids[..., prefix_len:], past_key_values=kv)
+            prefix = pre[0] if self.layer == "last" else pre[1]
+            status = "miss"
+            prefix_tags = token_tags_from_embeds_info(seq, embeds_info)[:prefix_len]
+            # text after the last vision block is sequential and equal on the three axes: one number carries it
+            self._prefix_cache = {"key": key, "prefix_len": prefix_len, "first_pos": int(position_ids[0, prefix_len].item()),
+                                  "states": prefix.to(store_device), "tags": prefix_tags,
+                                  "kv": [(k.to(store_device), v.to(store_device)) for k, v, _ in kv]}
+
+        suffix_states = out[0] if self.layer == "last" else out[1]
+        if self.layer == "last":
+            z = torch.cat((prefix, suffix_states), dim=1)
+        else:  # [B, layers, T, C] raw intermediates, joined before the connector (it replaces token 0 with a sink)
+            z = torch.cat((prefix, suffix_states), dim=2)
+            if hasattr(self.transformer, "text_connector"):
+                z = self.transformer.text_connector(z)
+        self.prefix_cache_status = status
+        self.transformer.last_token_tags = torch.cat((prefix_tags, torch.ones(seq - prefix_tags.shape[0], dtype=torch.long)))
+        return z.float(), None
 
     def encode_token_weights(self, token_weight_pairs):
         out = super().encode_token_weights(token_weight_pairs)
@@ -153,13 +335,22 @@ class PH3ImageClipModel(MiniMaxH3ClipModel):
         super().__init__(device=device, layer=PH3_IMAGE_HIDDEN_STATES, dtype=dtype, model_class=PH3ImageQwen3VL, model_options=model_options)
 
 
-class MiniMaxH3TEModel(comfy.sd1_clip.SD1ClipModel):
+class PatchStateMixin:
+    # ModelPatcher records the patch set it loaded (uuid, rerolled by every add_patches such as a CLIP LoRA) as
+    # current_weight_patches_uuid on the model it wraps, which is this SD1ClipModel wrapper, not the inner clip model.
+    # Hand it down so the prefix cache is invalidated when the patches change.
+    def encode_token_weights(self, token_weight_pairs):
+        getattr(self, self.clip).patch_state = getattr(self, "current_weight_patches_uuid", None)
+        return super().encode_token_weights(token_weight_pairs)
+
+
+class MiniMaxH3TEModel(PatchStateMixin, comfy.sd1_clip.SD1ClipModel):
     def __init__(self, device="cpu", dtype=None, model_options={}):
         super().__init__(device=device, dtype=dtype, name="qwen3vl_32b",
                          clip_model=MiniMaxH3ClipModel, model_options=model_options)
 
 
-class PH3ImageTEModel(comfy.sd1_clip.SD1ClipModel):
+class PH3ImageTEModel(PatchStateMixin, comfy.sd1_clip.SD1ClipModel):
     def __init__(self, device="cpu", dtype=None, model_options={}):
         super().__init__(device=device, dtype=dtype, name="qwen3vl_4b",
                          clip_model=PH3ImageClipModel, model_options=model_options)

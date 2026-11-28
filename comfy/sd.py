@@ -369,7 +369,7 @@ class CLIP:
 
             self.load_model(tokens)
             device = self.patcher.load_device
-            self.cond_stage_model.set_clip_options({"execution_device": device})
+            self.cond_stage_model.set_clip_options({"execution_device": device, "weight_hooks": True})
             all_hooks.reset()
             self.patcher.patch_hooks(None)
             if show_pbar:
@@ -421,7 +421,8 @@ class CLIP:
 
         self.load_model(tokens)
         device = self.patcher.load_device
-        self.cond_stage_model.set_clip_options({"execution_device": device})
+        # forced hooks patch weights in place without a new patches uuid
+        self.cond_stage_model.set_clip_options({"execution_device": device, "weight_hooks": self.patcher.forced_hooks is not None})
 
         with model_management.cuda_device_context(device):
             o = self.cond_stage_model.encode_token_weights(tokens)
