@@ -217,7 +217,8 @@ def test_weight_hooks_bypass_cache(tiny):
     assert_same(hooked, plain)
 
 
-def test_vision_dtype(tiny32, monkeypatch):
+def test_vision_runs_fp32(tiny32, monkeypatch):
+    # bf16 vision changed the 32B output far beyond rounding on real weights: the tower stays fp32
     te, clip, tok, calls = tiny32
     seen = []
     patch_embed = clip.transformer.visual.patch_embed.forward
@@ -226,19 +227,11 @@ def test_vision_dtype(tiny32, monkeypatch):
         return patch_embed(x, *a, **k)
     clip.transformer.visual.patch_embed.forward = spy
 
-    encode(te, tok, "fp32 weights", "img2")
-    assert seen and set(seen) == {torch.float32}
-
-    clip.transformer.visual.to(torch.float16)
-    assert clip.transformer.vision_dtype() == torch.float32  # fp16 can overflow: stays fp32
-
     clip.transformer.visual.to(torch.bfloat16)
-    assert clip.transformer.vision_dtype() == torch.bfloat16
-    seen.clear()
     clip._prefix_cache = None
     monkeypatch.setattr(minimax, "PREFIX_CACHE", False)
     plain = encode(te, tok, "bf16 weights", "ref2va")
-    assert seen and set(seen) == {torch.bfloat16}              # images and video blocks
+    assert seen and set(seen) == {torch.float32}               # images and video blocks
     monkeypatch.setattr(minimax, "PREFIX_CACHE", True)
     cached = encode(te, tok, "bf16 weights", "ref2va")
     assert clip.prefix_cache_status == "miss"

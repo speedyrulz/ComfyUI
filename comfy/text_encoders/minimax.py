@@ -31,7 +31,7 @@ import comfy.model_management
 import comfy.ops
 import comfy.sd1_clip
 from .qwen3vl import Qwen3VL, Qwen3VLSDTokenizer
-from .qwen_vl import smart_resize, process_qwen2vl_images
+from .qwen_vl import smart_resize
 
 # Persistent prefix cache (see MiniMaxH3ClipModel.forward). Set COMFY_MINIMAX_PREFIX_CACHE=0 to disable.
 PREFIX_CACHE = os.environ.get("COMFY_MINIMAX_PREFIX_CACHE", "1") != "0"
@@ -88,33 +88,12 @@ def token_tags_from_embeds_info(seq_len, embeds_info):
 class MiniMaxQwen3VL(Qwen3VL):
     model_type = "qwen3vl_32b"
 
-    def vision_dtype(self):
-        # bf16 vision weights run the tower in bf16 (as the transformers reference does); anything else (fp16 can
-        # overflow in the tower, fp32) stays fp32. The text-encoder ops cast weights to the input dtype.
-        if self.visual.patch_embed.proj.weight.dtype == torch.bfloat16:
-            return torch.bfloat16
-        return torch.float32
-
     def preprocess_embed(self, embed, device):
-        if embed["type"] != "image":
-            return None, None
-        data = embed["data"]
-        # optional {id(data): (data, merged, extra)} set by a caller that encodes the same images more than once
-        cache = self.vision_cache
-        if cache is not None:
-            hit = cache.get(id(data))
-            if hit is not None and hit[0] is data:
-                return hit[1], hit[2]
-        if embed.get("minimax_video_block", False):
-            flatten, grid = process_video_block(data)
-        else:
-            # Qwen3-VL normalizes to [-1, 1] (mean/std 0.5)
-            flatten, grid = process_qwen2vl_images(data, patch_size=16, image_mean=QWEN_IMAGE_MEAN, image_std=QWEN_IMAGE_STD)
-        merged, deepstack = self.visual(flatten.to(device, dtype=self.vision_dtype()), grid)
-        extra = {"grid": grid, "deepstack": deepstack}
-        if cache is not None:
-            cache[id(data)] = (data, merged, extra)
-        return merged, extra
+        if embed["type"] == "image" and embed.get("minimax_video_block", False):
+            flatten, grid = process_video_block(embed["data"])
+            merged, deepstack = self.visual(flatten.to(device, dtype=torch.float32), grid)
+            return merged, {"grid": grid, "deepstack": deepstack}
+        return super().preprocess_embed(embed, device)
 
     def forward(self, input_ids, attention_mask=None, embeds=None, num_tokens=None,
                 intermediate_output=None, final_layer_norm_intermediate=True,
